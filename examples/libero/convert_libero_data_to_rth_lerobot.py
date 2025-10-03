@@ -24,6 +24,10 @@ from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 import tensorflow_datasets as tfds
 import tyro
 import numpy as np
+from collections import Counter
+from mpl_toolkits.mplot3d import Axes3D
+import matplotlib.pyplot as plt
+import imageio
 
 REPO_NAME = "rth/libero"  # Name of the output dataset, also used for the Hugging Face Hub
 RAW_DATASET_NAMES = [
@@ -33,38 +37,172 @@ RAW_DATASET_NAMES = [
     "libero_spatial_no_noops",
 ]  # For simplicity we will combine multiple Libero datasets into one training dataset
 
-def make_motion_labels(delta_actions, grippers, window=20, thresh=1e-3):
-    labels = []
-    prev_sign = np.sign(grippers[0])
 
-    # Initialize labels with just movement directions
-    for d in delta_actions:
-        dirs = []
-        if abs(d[0]) > thresh:
-            dirs.append("forward" if d[0] > 0 else "backward")
-        if abs(d[1]) > thresh:
-            dirs.append("right" if d[1] > 0 else "left")
-        if abs(d[2]) > thresh:
-            dirs.append("up" if d[2] > 0 else "down")
-        labels.append("move " + " ".join(dirs) if dirs else "stay")
+def visualize(steps, motion_labels, task_instruction=None, stride=5, filename=None):
+    """
+    Visualize an episode:
+    - Left: End effector trajectory with current step highlighted (fixed limits, fixed view)
+    - Right: Image frame
+    - Task shown as multi-line centered title (top)
+    - Motion shown as multi-line centered caption (bottom)
+    - Optionally save to GIF if filename is provided
+    """
+    # extract delta actions and grippers
+    delta_actions = np.array([s["action"][:3] for s in steps])
+    grippers = np.array([s["action"][-1] for s in steps])
 
-    # Look for gripper sign changes
-    for i in range(1, len(grippers)):
-        sign = np.sign(grippers[i])
-        if sign != prev_sign and sign != 0:  # sign change detected
-            action = "open gripper" if sign < 0 else "close gripper"
+    # integrate deltas -> trajectory
+    positions = np.cumsum(delta_actions, axis=0)
+    positions = np.vstack([[0,0,0], positions])  # start at origin
 
-            # half before, half after
-            half = window // 2
-            start = max(0, i - half)
-            end = min(len(labels), i + half + 1)
+    # global bounds
+    x_min, x_max = positions[:,0].min(), positions[:,0].max()
+    y_min, y_max = positions[:,1].min(), positions[:,1].max()
+    z_min, z_max = positions[:,2].min(), positions[:,2].max()
 
-            for j in range(start, end):
-                labels[j] = labels[j] + f" {action}"
+    # setup fig
+    fig = plt.figure(figsize=(10,6))
+    ax_traj = fig.add_subplot(1,2,1, projection="3d")
+    ax_img = fig.add_subplot(1,2,2)
 
-        prev_sign = sign
+    # format task instruction for multi-line (split roughly in half)
+    if task_instruction:
+        words = task_instruction.split()
+        mid = len(words) // 2
+        task_instruction = " ".join(words[:mid]) + "\n" + " ".join(words[mid:])
+        fig.suptitle(task_instruction, fontsize=16, y=0.97, ha="center")
 
-    return labels
+    # placeholder motion caption at bottom
+    motion_text_obj = fig.text(0.5, 0.02, "", ha="center", va="bottom",
+                               fontsize=16)
+
+    # collect frames if saving
+    frames = []
+
+    for t in range(0, len(steps), stride):
+        ax_traj.cla()
+        ax_img.cla()
+
+        # plot trajectory up to t
+        ax_traj.plot(positions[:t+1,0], positions[:t+1,1], positions[:t+1,2], "r-")
+
+        # current gripper state (black = closed, white = open)
+        color = "black" if grippers[t] > 0 else "white"
+        ax_traj.scatter(
+            positions[t,0], positions[t,1], positions[t,2],
+            c=color, s=80, edgecolor="k"
+        )
+
+        # fixed limits and view
+        ax_traj.set_xlim(x_max, x_min)
+        ax_traj.set_ylim(y_min, y_max)
+        ax_traj.set_zlim(z_min, z_max)
+        ax_traj.view_init(elev=20, azim=-180)
+
+        # show image
+        img = steps[t]["observation"]["image"]
+        ax_img.imshow(img)
+        ax_img.axis("off")
+
+        # update motion caption (split if long)
+        motion_label = motion_labels[t]
+        words = motion_label.split()
+        if len(words) > 4:
+            mid = len(words)//2
+            motion_label = " ".join(words[:mid]) + "\n" + " ".join(words[mid:])
+        motion_text_obj.set_text(motion_label)
+
+        # capture frame if saving
+        if filename:
+            fig.canvas.draw()
+            w, h = fig.canvas.get_width_height()
+            buf = np.frombuffer(fig.canvas.tostring_argb(), dtype=np.uint8)
+            buf = buf.reshape(h, w, 4)   # ARGB
+            
+            # reorder ARGB -> RGBA
+            buf = buf[:, :, [1, 2, 3, 0]]
+            
+            # drop alpha if you just want RGB
+            frame = buf[:, :, :3]
+            frames.append(frame)
+        else:
+            plt.pause(0.1)
+
+    # save gif if requested
+    if filename:
+        imageio.mimsave(filename, frames, fps=20)
+        print(f"Saved visualization to {filename}")
+    else:
+        plt.show()
+
+def chunk_motion_labels(delta_actions, grippers, chunk_size=50, move_thresh=1e-3, frac_thresh=0.25, tile=True):
+    """
+    Coarse motion labels with per-axis dominant direction and gripper *change detection*.
+    If no gripper change in the window, no gripper label is added.
+    """
+    n = len(delta_actions)
+    chunk_labels = []
+
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        window_actions = delta_actions[start:end]
+        window_grippers = grippers[start:end]
+
+        # --- Movement axes ---
+        x_moves, y_moves, z_moves = [], [], []
+        for d in window_actions:
+            if abs(d[0]) > move_thresh:
+                x_moves.append("forward" if d[0] > 0 else "backward")
+            if abs(d[1]) > move_thresh:
+                y_moves.append("right" if d[1] > 0 else "left")
+            if abs(d[2]) > move_thresh:
+                z_moves.append("up" if d[2] > 0 else "down")
+
+        def dominant(moves, neutral="stay"):
+            if not moves:
+                return neutral
+            counts = Counter(moves)
+            top_label, count = counts.most_common(1)[0]
+            if count / len(moves) >= frac_thresh:
+                return top_label
+            return neutral
+
+        x_label = dominant(x_moves)
+        y_label = dominant(y_moves)
+        z_label = dominant(z_moves)
+
+        # --- Gripper changes ---
+        g_signs = np.sign(window_grippers)
+        
+        # prepend the last gripper state from previous chunk for continuity
+        if start > 0:
+            prev_state = np.sign(grippers[start-1])
+            g_signs = np.insert(g_signs, 0, prev_state)
+        
+        g_changes = np.where(np.diff(g_signs) != 0)[0]
+        
+        g_label = None
+        if len(g_changes) > 0:
+            # take the last change in this chunk (ignoring the synthetic prepend index)
+            last_idx = g_changes[-1]
+            new_state = g_signs[last_idx + 1]  # state after change
+            if new_state > 0:
+                g_label = "close gripper"
+            elif new_state < 0:
+                g_label = "open gripper"
+
+
+        # --- Combine ---
+        parts = [p for p in [x_label, y_label, z_label, g_label] if p not in ("stay", None)]
+        label = "move " + " ".join(parts) if parts else "stay"
+
+        if tile:
+            chunk_labels.extend([label] * (end - start))
+        else:
+            chunk_labels.append(label)
+
+    return chunk_labels
+>>>>>>> 0f691c802d7a287d789f3423601c4c45cfc692b7
 
 def main(data_dir: str, *, push_to_hub: bool = False):
     # Clean up any existing dataset in the output directory
@@ -114,8 +252,16 @@ def main(data_dir: str, *, push_to_hub: bool = False):
             delta_actions = [step["action"][:3] for step in steps]
             grippers = [step["action"][-1] for step in steps]
 
-            motion_labels = make_motion_labels(np.array(delta_actions), np.array(grippers))
+            motion_labels = chunk_motion_labels(
+                np.array(delta_actions),
+                np.array(grippers),
+                chunk_size=10, 
+                tile=True
+            )
 
+            task_instruction = steps[0]["language_instruction"].decode()
+            #visualize(steps, motion_labels, task_instruction=task_instruction, stride=1, filename='%s.gif'%(str(i)))
+            #visualize(steps, motion_labels, task_instruction=task_instruction, stride=1)
             for t, step in enumerate(steps):
                 dataset.add_frame(
                     {
