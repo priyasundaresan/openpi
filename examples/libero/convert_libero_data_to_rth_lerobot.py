@@ -177,21 +177,28 @@ def chunk_motion_labels(delta_actions, grippers, chunk_size=50, move_thresh=1e-3
 
         # --- Gripper changes ---
         g_signs = np.sign(window_grippers)
+        
+        # prepend the last gripper state from previous chunk for continuity
+        if start > 0:
+            prev_state = np.sign(grippers[start-1])
+            g_signs = np.insert(g_signs, 0, prev_state)
+        
         g_changes = np.where(np.diff(g_signs) != 0)[0]
-
+        
         g_label = None
         if len(g_changes) > 0:
-            # take the last change in this chunk
-            last_idx = g_changes[-1] + 1
-            new_state = g_signs[last_idx]
+            # take the last change in this chunk (ignoring the synthetic prepend index)
+            last_idx = g_changes[-1]
+            new_state = g_signs[last_idx + 1]  # state after change
             if new_state > 0:
                 g_label = "close gripper"
             elif new_state < 0:
                 g_label = "open gripper"
 
+
         # --- Combine ---
         parts = [p for p in [x_label, y_label, z_label, g_label] if p not in ("stay", None)]
-        label = " ".join(parts) if parts else "stay"
+        label = "move " + " ".join(parts) if parts else "stay"
 
         if tile:
             chunk_labels.extend([label] * (end - start))
@@ -257,7 +264,7 @@ def main(data_dir: str, *, push_to_hub: bool = False):
 
             task_instruction = steps[0]["language_instruction"].decode()
             #visualize(steps, motion_labels, task_instruction=task_instruction, stride=1, filename='%s.gif'%(str(i)))
-            visualize(steps, motion_labels, task_instruction=task_instruction, stride=1)
+            #visualize(steps, motion_labels, task_instruction=task_instruction, stride=1)
             for t, step in enumerate(steps):
                 dataset.add_frame(
                     {
