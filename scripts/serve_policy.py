@@ -73,7 +73,7 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
         #config="pi05_libero",
         #dir="checkpoints/pi05_libero",
         config="pi0_libero_rth_low_mem_finetune",
-        dir="checkpoints_new/pi0_libero_rth_low_mem_finetune/rth_libero/29999",
+        dir="checkpoints_new/pi0_libero_rth_low_mem_finetune/rth_libero/27000",
     ),
 }
 
