@@ -125,7 +125,7 @@ class Args:
     # LIBERO environment-specific parameters
     #################################################################################################################
     task_suite_name: str = (
-        "libero_spatial"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
+        "libero_10"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
@@ -200,6 +200,7 @@ def eval_libero(args: Args) -> None:
                     # and we need to wait for them to fall
                     if t < args.num_steps_wait:
                         obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
+                        env.render()
 
                         t += 1
                         continue
@@ -224,12 +225,13 @@ def eval_libero(args: Args) -> None:
 
                         #input_description = input("What action to take")
                         # --- Ask user to pick ---
-                        print("\nAvailable motion prompts:")
-                        for i, p in enumerate(MOTION_PROMPTS, start=1):
-                            print(f"{i}. {p}")
+                        #print("\nAvailable motion prompts:")
+                        #for i, p in enumerate(MOTION_PROMPTS, start=1):
+                        #    print(f"{i}. {p}")
                         
-                        choice = int(input("\nPick a motion (1-81): "))
-                        input_description = MOTION_PROMPTS[choice - 1]
+                        #choice = int(input("\nPick a motion (1-81): "))
+                        #input_description = MOTION_PROMPTS[choice - 1]
+                        input_description = input('\nPick a motion: ')
                         
                         print(f"\n✅ You selected: {input_description}")
 

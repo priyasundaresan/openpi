@@ -245,7 +245,7 @@ def main(data_dir: str, *, push_to_hub: bool = False):
     for raw_dataset_name in RAW_DATASET_NAMES:
         raw_dataset = tfds.load(raw_dataset_name, data_dir=data_dir, split="train")
 
-        for episode in raw_dataset:
+        for i, episode in enumerate(raw_dataset):
 
             steps = list(episode["steps"].as_numpy_iterator())
             delta_actions = [step["action"][:3] for step in steps]
