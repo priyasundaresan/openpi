@@ -20,5 +20,6 @@ source /iliad/u/priyasun/miniconda3/bin/activate
 cd /iliad/u/priyasun/openpi
 source examples/libero/.venv/bin/activate
 export HF_HOME=/iliad/u/priyasun/huggingface_cache
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi0_libero_rth_low_mem_finetune --exp_name=rth_libero --overwrite
+#XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi0_libero_rth_low_mem_finetune --exp_name=rth_libero --overwrite
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_libero_rth_low_mem_finetune --exp_name=rth_libero_pi05 --overwrite
 wait
