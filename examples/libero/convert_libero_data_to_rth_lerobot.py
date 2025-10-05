@@ -202,7 +202,6 @@ def chunk_motion_labels(delta_actions, grippers, chunk_size=50, move_thresh=1e-3
             chunk_labels.append(label)
 
     return chunk_labels
->>>>>>> 0f691c802d7a287d789f3423601c4c45cfc692b7
 
 def main(data_dir: str, *, push_to_hub: bool = False):
     # Clean up any existing dataset in the output directory
@@ -246,7 +245,7 @@ def main(data_dir: str, *, push_to_hub: bool = False):
     for raw_dataset_name in RAW_DATASET_NAMES:
         raw_dataset = tfds.load(raw_dataset_name, data_dir=data_dir, split="train")
 
-        for episode in raw_dataset:
+        for i, episode in enumerate(raw_dataset):
 
             steps = list(episode["steps"].as_numpy_iterator())
             delta_actions = [step["action"][:3] for step in steps]
