@@ -17,19 +17,15 @@ import tensorflow_datasets as tfds
 import tyro
 
 from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
+import numpy as np
 from collections import Counter
 from mpl_toolkits.mplot3d import Axes3D
 import matplotlib.pyplot as plt
 import imageio
 
 REPO_NAME = "aug/libero"
-#RAW_DATASET_NAMES = [
-#    "libero_10_no_noops",
-#    "libero_goal_no_noops",
-#    "libero_object_no_noops",
-#    "libero_spatial_no_noops",
-#]
 RAW_DATASET_NAMES = [
+    "libero_10_no_noops",
     "libero_goal_no_noops",
     "libero_object_no_noops",
     "libero_spatial_no_noops",
