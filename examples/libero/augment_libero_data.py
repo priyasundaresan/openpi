@@ -2,6 +2,7 @@ import json
 import random
 from collections import Counter
 from pathlib import Path
+import argparse
 
 import torch
 from tqdm import tqdm
@@ -9,14 +10,21 @@ from transformers import pipeline
 import tensorflow_datasets as tfds
 
 # ----------------------------
+# Command-line args
+# ----------------------------
+parser = argparse.ArgumentParser()
+parser.add_argument("--device", type=int, default=0, help="GPU device index")
+parser.add_argument("--dataset", type=str, default=None, help="Optional: process only this dataset")
+args = parser.parse_args()
+
+# ----------------------------
 # Config
 # ----------------------------
 DATA_DIR = "modified_libero_rlds"  # <-- Set your dataset path here
 MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
-DEVICE = 0  # GPU device index
-CHUNK_SIZE = 10      
-BATCH_SIZE = 128       
-OUTPUT_JSON = "paraphrased_instructions.json"
+DEVICE = args.device
+CHUNK_SIZE = 10
+BATCH_SIZE = 128
 
 RAW_DATASET_NAMES = [
     "libero_10_no_noops",
@@ -24,6 +32,10 @@ RAW_DATASET_NAMES = [
     "libero_object_no_noops",
     "libero_spatial_no_noops",
 ]
+
+# If user specified a dataset, override the list
+if args.dataset:
+    RAW_DATASET_NAMES = [args.dataset]
 
 # ----------------------------
 # Load model as a pipeline
@@ -91,9 +103,7 @@ def chunk_motion_labels(delta_actions, grippers, chunk_size=CHUNK_SIZE, move_thr
 # ----------------------------
 # Prompt for human-like paraphrasing
 # ----------------------------
-
 def make_prompt(instruction: str) -> str:
-    # Encourage different communication styles people might use with robots
     style = random.choice([
         "as a casual person speaking naturally to a home robot",
         "as someone giving quick, efficient task commands",
@@ -162,26 +172,18 @@ Instruction: {instruction}
 Rephrased:
 """
 
-
-
 # ----------------------------
 # JSON parsing
 # ----------------------------
 def parse_first_json(text: str) -> str:
-    """
-    Extract 'rephrased' from model output JSON.
-    Returns lowercase string. Falls back to stripped text if JSON parsing fails or is empty.
-    """
     text = text.strip()
     try:
-        # Remove code fences if present
         if "```json" in text:
             text = text.split("```json")[1].split("```")[0].strip()
         data = json.loads(text)
         return data.get("rephrased", "").strip().lower().replace('.', '').replace(',', '')
     except Exception:
-        # fallback: return the raw text
-        return text.strip().lower().replace('.', '').replace(',', '')
+        return text.strip().lower().replace('.', '',).replace(',', '')
 
 # ----------------------------
 # Main loop
@@ -194,6 +196,8 @@ def main():
         raw_dataset = tfds.load(raw_dataset_name, data_dir=str(data_dir), split="train")
         print(f"Processing dataset {raw_dataset_name} with {len(raw_dataset)} episodes")
 
+        augmented_data[raw_dataset_name] = {}
+
         for ep_idx, episode in enumerate(tqdm(raw_dataset, desc=f"Dataset {raw_dataset_name}")):
             steps = list(episode["steps"].as_numpy_iterator())
             delta_actions = [step["action"][:3] for step in steps]
@@ -201,8 +205,10 @@ def main():
 
             task_instruction = steps[0]["language_instruction"].decode()
             motion_labels = chunk_motion_labels(delta_actions, grippers, chunk_size=CHUNK_SIZE)
-            for j in range(0, len(motion_labels), 3):
-                motion_labels[j] = task_instruction
+
+            # Optional: first label is always task instruction
+            if motion_labels:
+                motion_labels[0] = task_instruction
 
             paraphrased_labels = []
 
@@ -212,29 +218,24 @@ def main():
             for i in range(0, len(motion_labels), BATCH_SIZE):
                 batch = motion_labels[i:i+BATCH_SIZE]
                 prompts = [make_prompt(label) for label in batch]
-
-                # Run pipeline
                 results = pipe(prompts, max_new_tokens=64, temperature=1.2, top_p=0.9)
-
-                # Parse JSON output
                 paraphrased_labels.extend([parse_first_json(r["generated_text"]) for r in results])
 
-            augmented_data[f"{raw_dataset_name}_episode_{ep_idx}"] = {
-                "original": motion_labels,
-                "paraphrased": paraphrased_labels
-            }
+            # ----------------------------
+            # Save per-step JSON
+            # ----------------------------
+            episode_dict = {}
+            for step_idx, (orig, para) in enumerate(zip(motion_labels, paraphrased_labels)):
+                episode_dict[f"step_{step_idx}"] = {"original": orig, "paraphrased": para}
 
-            # Print a few spaced-out examples
-            for j in range(0, len(motion_labels)):
-                print(f"Original: {motion_labels[j]} -> Paraphrased: {paraphrased_labels[j]}")
-            print("-" * 50)
+            augmented_data[raw_dataset_name][f"episode_{ep_idx}"] = episode_dict
 
-    # Save JSON
-    with open(OUTPUT_JSON, "w") as f:
+    # Save final JSON
+    output_json = f"paraphrased_instructions_flat_gpu{DEVICE}.json"
+    with open(output_json, "w") as f:
         json.dump(augmented_data, f, indent=2)
-
-    print(f"Augmented dataset saved to {OUTPUT_JSON}")
-
+    print(f"Augmented dataset saved to {output_json}")
 
 if __name__ == "__main__":
     main()
+
