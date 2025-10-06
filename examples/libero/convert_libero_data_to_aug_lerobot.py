@@ -215,7 +215,9 @@ def main(data_dir: str, json_dir: str, *, push_to_hub: bool = False):
             augmented_instructions = chunk_and_tile_labels(n_steps, ep_json, chunk_size=CHUNK_SIZE)
 
             task_instruction = steps[0]["language_instruction"].decode()
-            visualize(steps, augmented_instructions, task_instruction=task_instruction, stride=1)
+
+            #visualize(steps, augmented_instructions, task_instruction=task_instruction, stride=1)
+            #visualize(steps, augmented_instructions, task_instruction=task_instruction, stride=1, filename='%s.gif'%(str(i)))
             for t, step in enumerate(steps):
                 dataset.add_frame(
                     {
