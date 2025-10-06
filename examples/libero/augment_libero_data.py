@@ -1,23 +1,21 @@
 import json
-import re
+import random
 from collections import Counter
 from pathlib import Path
 
 import torch
 from tqdm import tqdm
-from transformers import AutoTokenizer, Qwen2VLForConditionalGeneration
+from transformers import pipeline
 import tensorflow_datasets as tfds
-
-from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
 
 # ----------------------------
 # Config
 # ----------------------------
 DATA_DIR = "modified_libero_rlds"  # <-- Set your dataset path here
-MODEL_ID = "Qwen/Qwen2-VL-7B-Instruct"
-DEVICE = "cuda"
-CHUNK_SIZE = 10       # steps per motion chunk
-BATCH_SIZE = 16       # process 16 chunks at a time
+MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
+DEVICE = 0  # GPU device index
+CHUNK_SIZE = 10      
+BATCH_SIZE = 128       
 OUTPUT_JSON = "paraphrased_instructions.json"
 
 RAW_DATASET_NAMES = [
@@ -28,18 +26,19 @@ RAW_DATASET_NAMES = [
 ]
 
 # ----------------------------
-# Load model
+# Load model as a pipeline
 # ----------------------------
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-model = Qwen2VLForConditionalGeneration.from_pretrained(
-    MODEL_ID, device_map="auto", torch_dtype=torch.bfloat16
+pipe = pipeline(
+    task="text2text-generation",
+    model=MODEL_ID,
+    device=DEVICE,
+    dtype=torch.bfloat16
 )
-model.eval()
 
 # ----------------------------
 # Motion chunking
 # ----------------------------
-def chunk_motion_labels(delta_actions, grippers, chunk_size=10, move_thresh=1e-3, frac_thresh=0.25):
+def chunk_motion_labels(delta_actions, grippers, chunk_size=CHUNK_SIZE, move_thresh=1e-3, frac_thresh=0.25):
     n = len(delta_actions)
     chunk_labels = []
 
@@ -92,36 +91,60 @@ def chunk_motion_labels(delta_actions, grippers, chunk_size=10, move_thresh=1e-3
 # ----------------------------
 # Prompt for human-like paraphrasing
 # ----------------------------
+
 def make_prompt(instruction: str) -> str:
+    # Encourage different communication styles people might use with robots
+    style = random.choice([
+        "as a casual person speaking naturally to a home robot",
+        "as a friendly collaborator in a shared workspace",
+        "as someone giving quick, efficient task commands",
+        "as a curious user testing the robot's understanding",
+        "as if giving polite, conversational instructions",
+    ])
+
     return f"""
-You are a human instructing a Panda robot with a parallel-jaw gripper.
-Your goal is to rephrase the following given instruction differently.
-Be casual and creative, consider phrasings like "slide", "move your arm", "bring your gripper", etc.
-Output strictly as JSON.
+You are rewriting action commands for a Panda parallel-jaw gripper robot into natural human language.
+Your goal is to show how people with different communication styles might speak to a robot.
+Rephrase each instruction to sound realistic and human — not robotic or repetitive.
+Vary your verbs, phrasing, sentence structure, and tone.
+Output only valid JSON in this format: {{"rephrased": "<your version>"}}.
 
-Example Instruction: move right down close gripper
-Example Rephrased 1: {{"rephrased": "go a little to the right then down and close your gripper"}}
-Example Rephrased 2: {{"rephrased": "slide to the right down and close the gripper"}}
-Example Rephrased 3: {{"rephrased": "go to the right and down and close"}}
+Examples:
+Instruction: move left down close gripper
+Rephrased: {{"rephrased": "go a bit left and lower down, then close the gripper"}}
+
+Instruction: move forward up open gripper
+Rephrased: {{"rephrased": "move forward and lift up a little, then open your gripper"}}
+
+Instruction: stay
+Rephrased: {{"rephrased": "don't move"}}
+
 ---
-
+Now, write a rephrased instruction {style}.
 Instruction: {instruction}
-Rephrased: 
+Rephrased:
 """
+
+
 
 # ----------------------------
 # JSON parsing
 # ----------------------------
 def parse_first_json(text: str) -> str:
     """
-    Extract 'command' from model output with ```json fences.
+    Extract 'rephrased' from model output JSON.
     Returns lowercase string. Falls back to stripped text if JSON parsing fails or is empty.
     """
     text = text.strip()
-    text = text.split('```json')[1].split('```')[0]
-    text = text.strip()
-    data = json.loads(text)
-    return data.get("rephrased", "").strip().lower().replace('.', '').replace(',', '')
+    try:
+        # Remove code fences if present
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0].strip()
+        data = json.loads(text)
+        return data.get("rephrased", "").strip().lower().replace('.', '').replace(',', '')
+    except Exception:
+        # fallback: return the raw text
+        return text.strip().lower().replace('.', '').replace(',', '')
 
 # ----------------------------
 # Main loop
@@ -146,25 +169,15 @@ def main():
             # ----------------------------
             # Batch inference
             # ----------------------------
-            paraphrased_labels = []
-            
             for i in range(0, len(motion_labels), BATCH_SIZE):
                 batch = motion_labels[i:i+BATCH_SIZE]
                 prompts = [make_prompt(label) for label in batch]
-            
-                # Tokenize batch like in your test script
-                inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(DEVICE)
-            
-                # Generate paraphrases
-                with torch.no_grad():
-                    outputs = model.generate(**inputs, max_new_tokens=64, do_sample=True, top_p=0.9, temperature=0.7)
-            
-                # Decode outputs exactly like test script
-                paraphrased_labels.extend([
-                    parse_first_json(tokenizer.decode(o, skip_special_tokens=True))
-                    for o in outputs
-                ])
 
+                # Run pipeline
+                results = pipe(prompts, max_new_tokens=64, temperature=1.2, top_p=0.9)
+
+                # Parse JSON output
+                paraphrased_labels.extend([parse_first_json(r["generated_text"]) for r in results])
 
             augmented_data[f"{raw_dataset_name}_episode_{ep_idx}"] = {
                 "original": motion_labels,
