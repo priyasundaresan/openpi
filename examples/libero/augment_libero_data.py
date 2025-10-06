@@ -96,10 +96,47 @@ def make_prompt(instruction: str) -> str:
     # Encourage different communication styles people might use with robots
     style = random.choice([
         "as a casual person speaking naturally to a home robot",
-        "as a friendly collaborator in a shared workspace",
         "as someone giving quick, efficient task commands",
         "as a curious user testing the robot's understanding",
         "as if giving polite, conversational instructions",
+        "say it like you would to a helpful robot at home",
+        "keep it simple and casual",
+        "give quick, direct instructions",
+        "describe it like you’re telling someone in the room",
+        "use everyday words you’d naturally say",
+        "say it as clearly as possible",
+        "make it short and to the point",
+        "use plain, friendly language"
+        "as someone a bit skeptical if the robot will understand",
+        "as someone talking to a clumsy robot that often messes up",
+        "as someone teaching a robot patiently for the first time",
+        "as someone in a hurry giving quick orders",
+        "as someone slightly frustrated or impatient",
+        "as someone trying to sound encouraging to the robot",
+        "as someone speaking like they’re giving directions to a friend",
+        "as someone treating the robot like a pet they’re fond of",
+        "as a person who’s multitasking and distracted",
+        "as a person testing if the robot can handle vague phrasing",
+        "as a person who over-explains things to make sure it listens",
+        "as someone who gives clipped, military-style commands",
+        "as someone pretending the robot is a coworker",
+        "as someone playfully joking with the robot",
+        "as someone who doubts the robot’s abilities and over-clarifies",
+        "as someone using slang or informal shorthand",
+        "as someone who’s being polite but firm",
+        "as someone who’s cautious and hesitant about breaking something",
+        "as someone impressed by the robot and talking enthusiastically",
+        "as someone slightly sarcastic about the robot following orders",
+        "as someone used to giving short, efficient directions",
+        "as someone issuing calm, steady instructions",
+        "as someone giving clear steps during a task",
+        "as someone who trusts the robot and speaks casually",
+        "as someone who gives short, helpful reminders",
+        "as someone trying to sound natural but firm",
+        "as someone summarizing what to do quickly",
+        "as someone who’s focused and wants minimal words",
+        "as someone who speaks efficiently but not abruptly",
+        "as someone directing a coworker briefly and clearly",
     ])
 
     return f"""
@@ -113,8 +150,8 @@ Examples:
 Instruction: move left down close gripper
 Rephrased: {{"rephrased": "go a bit left and lower down, then close the gripper"}}
 
-Instruction: move forward up open gripper
-Rephrased: {{"rephrased": "move forward and lift up a little, then open your gripper"}}
+Instruction: put the white and yellow mug to the right of the plate
+Rephrased: {{"rephrased": "grab the white and yellow mug and place it by the plate"}}
 
 Instruction: stay
 Rephrased: {{"rephrased": "don't move"}}
@@ -162,7 +199,10 @@ def main():
             delta_actions = [step["action"][:3] for step in steps]
             grippers = [step["action"][-1] for step in steps]
 
+            task_instruction = steps[0]["language_instruction"].decode()
             motion_labels = chunk_motion_labels(delta_actions, grippers, chunk_size=CHUNK_SIZE)
+            for j in range(0, len(motion_labels), 3):
+                motion_labels[j] = task_instruction
 
             paraphrased_labels = []
 
@@ -198,4 +238,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
