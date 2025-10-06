@@ -147,6 +147,34 @@ def make_prompt(instruction: str) -> str:
         "as someone who’s focused and wants minimal words",
         "as someone who speaks efficiently but not abruptly",
         "as someone directing a coworker briefly and clearly",
+        "as someone rephrasing the instruction with natural synonyms for the action verbs",
+        "as someone saying the same thing but swapping verbs like pick up → grab or put → place",
+        "as someone using everyday verbs that mean the same thing for handling or moving objects",
+        "as someone restating it with slightly different action words but the same intent",
+        "as someone giving identical instructions using familiar hand-action verbs",
+        "as someone who changes the verbs to more natural alternatives",
+        "as someone who swaps out stiff action words for casual ones",
+        "as someone who tweaks the verbs to sound like everyday speech",
+        "as someone who replaces robotic commands with friendly verbs",
+        "as someone who rewords the actions using playful, human verbs",
+        "as someone who modifies the verbs to make instructions more lively",
+        "as someone who alternates the verbs while keeping the same meaning",
+        "as someone who adjusts the action words to sound like a person talking",
+        "as someone who substitutes dry verbs with more expressive ones",
+        "as someone who remixes the verbs to give a human touch to the instructions"
+        "as someone replacing technical verbs with natural ones people actually say",
+        "as someone keeping the meaning identical but using a more natural verb choice",
+        "as someone using simple synonyms for manipulation actions like lift, set, or hold",
+        "as someone who changes only the verbs to sound more human while keeping the task the same",
+        "as someone paraphrasing it using alternative but equivalent verbs for the same motion",
+        "as someone who calls objects different things if objects are mentioned",
+        "as someone who sometimes refers to objects with slightly different names if objects are mentioned",
+        "as someone who uses alternative common terms for objects if objects are mentioned",
+        "as someone who swaps object names with natural synonyms if objects are mentioned",
+        "as someone rewording object references in a casual, human way if objects are mentioned",
+        "as someone who varies how objects are named if objects are mentioned",
+        "as someone giving instructions and occasionally changing object wording naturally if objects are mentioned",
+        "as someone who describes objects differently if objects are mentioned"
     ])
 
     return f"""
@@ -206,9 +234,12 @@ def main():
             task_instruction = steps[0]["language_instruction"].decode()
             motion_labels = chunk_motion_labels(delta_actions, grippers, chunk_size=CHUNK_SIZE)
 
-            # Optional: first label is always task instruction
-            if motion_labels:
-                motion_labels[0] = task_instruction
+            # Half the time, use the original task
+            num_to_replace = len(motion_labels) // 2
+            replace_indices = set(random.sample(range(len(motion_labels)), num_to_replace))
+            for i in range(len(motion_labels)):
+                if i in replace_indices:
+                    motion_labels[i] = task_instruction
 
             paraphrased_labels = []
 
@@ -229,12 +260,16 @@ def main():
                 episode_dict[f"step_{step_idx}"] = {"original": orig, "paraphrased": para}
 
             augmented_data[raw_dataset_name][f"episode_{ep_idx}"] = episode_dict
+            # Print a few spaced-out examples
+            #for j in range(0, len(motion_labels)):
+            #    print(f"Original: {motion_labels[j]} -> Paraphrased: {paraphrased_labels[j]}")
+            #    print("-" * 50)
 
-    # Save final JSON
-    output_json = f"paraphrased_instructions_flat_gpu{DEVICE}.json"
-    with open(output_json, "w") as f:
-        json.dump(augmented_data, f, indent=2)
-    print(f"Augmented dataset saved to {output_json}")
+        # Save final JSON
+        output_json = f"paraphrased_instructions_{raw_dataset_name}.json"
+        with open(output_json, "w") as f:
+            json.dump(augmented_data, f, indent=2)
+        print(f"Augmented dataset saved to {output_json}")
 
 if __name__ == "__main__":
     main()
