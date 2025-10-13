@@ -1,29 +1,28 @@
 import os
+import numpy as np
 import json
-import random
-from collections import Counter
 from pathlib import Path
 import argparse
 from PIL import Image, ImageDraw, ImageFont
-
-import torch
+import io
 from tqdm import tqdm
 import tensorflow_datasets as tfds
-from transformers import Qwen3VLMoeForConditionalGeneration, AutoProcessor
+from google import genai
+from google.genai import types
+from collections import Counter
 
 # ----------------------------
 # Command-line args
 # ----------------------------
 parser = argparse.ArgumentParser()
-parser.add_argument("--device", type=int, default=0, help="GPU device index")
 parser.add_argument("--dataset", type=str, default=None, help="Optional: process only this dataset")
+parser.add_argument("--api_key", type=str, required=True, help="Your Google API key for Gemini")
 args = parser.parse_args()
 
 # ----------------------------
 # Config
 # ----------------------------
 DATA_DIR = "modified_libero_rlds"  # <-- Set your dataset path here
-DEVICE = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
 CHUNK_SIZE = 10
 
 RAW_DATASET_NAMES = [
@@ -40,19 +39,9 @@ OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 # ----------------------------
-# Load Qwen2.5-VL
+# Initialize Gemini client
 # ----------------------------
-#model = Qwen3VLMoeForConditionalGeneration.from_pretrained(
-#    "Qwen/Qwen3-VL-30B-A3B-Instruct",
-#    dtype=torch.bfloat16,
-#    attn_implementation="flash_attention_2",
-#    device_map="auto",
-#)
-
-model = Qwen3VLMoeForConditionalGeneration.from_pretrained(
-    "Qwen/Qwen3-VL-30B-A3B-Instruct", dtype=torch.bfloat16, device_map="auto"
-)
-processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-30B-A3B-Instruct")
+client = genai.Client(api_key=args.api_key)
 
 # ----------------------------
 # Motion chunking
@@ -105,79 +94,66 @@ def chunk_motion_labels(delta_actions, grippers, chunk_size=CHUNK_SIZE, move_thr
     return chunk_labels
 
 # ----------------------------
-# Multimodal instruction generation
+# Multimodal instruction generation using Gemini
 # ----------------------------
 def swap_directions(instruction):
-    # Create temporary placeholders to avoid conflict while replacing
     instruction = instruction.replace('left', '__TEMP_LEFT__')
     instruction = instruction.replace('right', 'left')
     instruction = instruction.replace('__TEMP_LEFT__', 'right')
-
     instruction = instruction.replace('forward', '__TEMP_FORWARD__')
     instruction = instruction.replace('backward', 'forward')
     instruction = instruction.replace('__TEMP_FORWARD__', 'backward')
-
     return instruction
 
+def array_to_jpeg_bytes(img_array) -> bytes:
+    buf = io.BytesIO()
+    img_array.save(buf, format="JPEG")
+    return buf.getvalue()
 
 def generate_intermediate_instruction(start_img, end_img, task_instruction, motion_label):
-    task_instruction = swap_directions(task_instruction)
-    motion_label = swap_directions(motion_label)
     prompt = f"""
-    Goal of the Robot: {task_instruction}.
-    Current motion of the robot: {motion_label}.
-    Your Task: Describe what subtask the robot is doing right now given its overall goal and the current motion.
-    Input: The first image is the previous state of the robot performing the task, and the second image is the current state.
+    Overall Task: {task_instruction}.
+    Current image: A front-facing view of the robot currently.
+    Current motion of the robot: {motion_label}
+    NOTE: left/right = left/right in the image, backward = coming out of the screen toward you, forward = going into the screen away from you. The robot is guaranteed to only manipulate objects mentioned in the overall task.
+    Your Task: Describe what subtask the robot is doing right now given its overall task, the current motion, and the current image.
     Output format:
     ```json
     {{
-        "all stages": # given the goal of the robot and first image, describe all subtasks that the robot needs to do to complete its goal,
-        "reasoning": # explain how you determined which stage the robot is in and what it is doing,
-        "subtask": # a short sentence describing the robot’s current subtask
+        "all stages": # referring only to objects mentioned in the overall task, describe all subtasks that the robot needs to do to complete its goal,
+        "subtask": # a short sentence describing the robot’s current subtask, given the overall task, current motion, and current image. do not mention any objects not mentioned in the overall task,
+        "reasoning": # briefly explain how you determined which stage the robot is in and what it is doing,
+        "command": # rephrase the "subtask" as a command
     }}
     ```
     """
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {
-                    "type": "image",
-                    "image": start_img,
-                },
-                {
-                    "type": "image",
-                    "image": end_img,
-                },
-            ],
-        }
-    ]
-
-
-    # Preparation for inference
-    inputs = processor.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_dict=True,
-        return_tensors="pt"
+    # Example usage
+    start_img_bytes = array_to_jpeg_bytes(start_img)
+    end_img_bytes = array_to_jpeg_bytes(end_img)
+    
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[
+            types.Part.from_bytes(data=end_img_bytes, mime_type="image/jpeg"),
+            prompt
+        ]
     )
 
-    # Inference: Generation of the output
-    generated_ids = model.generate(**inputs, max_new_tokens=128)
-    generated_ids_trimmed = [
-        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids.to('cuda'), generated_ids)
-    ]
-    output_text = processor.batch_decode(
-        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-    )
-    return output_text
+    text = response.text.strip()
+    if text.startswith("```json"):
+        text = text[len("```json"):].strip()
+    if text.endswith("```"):
+        text = text[:-3].strip()
 
-# ----------------------------
-# Visualization
-# ----------------------------
+    try:
+        data = json.loads(text)
+        print(text)
+        command = data.get("command", None)
+    except json.JSONDecodeError:
+        print("Failed to parse JSON. Raw response:", text)
+        command = task_instruction
+    return command
+
 def save_visualization(start_img, end_img, task_instruction, motion_label, generated_label, dataset_name, ep_idx, chunk_idx):
     start_img_rgb = start_img.convert("RGB")
     end_img_rgb = end_img.convert("RGB")
@@ -185,7 +161,6 @@ def save_visualization(start_img, end_img, task_instruction, motion_label, gener
     canvas = Image.new("RGB", (width * 2, height + 150), color=(255, 255, 255))
     canvas.paste(start_img_rgb, (0, 0))
     canvas.paste(end_img_rgb, (width, 0))
-
     draw = ImageDraw.Draw(canvas)
     font = ImageFont.load_default()
     text_lines = [
@@ -195,75 +170,61 @@ def save_visualization(start_img, end_img, task_instruction, motion_label, gener
     ]
     for i, line in enumerate(text_lines):
         draw.text((10, height + i * 20), line, fill="black", font=font)
-
     vis_path = OUTPUT_DIR / f"{dataset_name}_episode{ep_idx}_{str(chunk_idx).zfill(3)}.png"
     canvas.save(vis_path)
 
-# ----------------------------
-# Main augmentation loop
-# ----------------------------
 def main():
     data_dir = Path(DATA_DIR)
     augmented_data = {}
-
     for raw_dataset_name in RAW_DATASET_NAMES:
         raw_dataset = tfds.load(raw_dataset_name, data_dir=str(data_dir), split="train")
         print(f"Processing dataset {raw_dataset_name} with {len(raw_dataset)} episodes")
         augmented_data[raw_dataset_name] = {}
-
         for ep_idx, episode in enumerate(tqdm(raw_dataset, desc=f"Dataset {raw_dataset_name}")):
             steps = list(episode["steps"].as_numpy_iterator())
             delta_actions = [step["action"][:3] for step in steps]
             grippers = [step["action"][-1] for step in steps]
 
             task_instruction = steps[0]["language_instruction"].decode()
+            task_instruction = swap_directions(task_instruction)
+
             motion_labels = chunk_motion_labels(delta_actions, grippers, chunk_size=CHUNK_SIZE)
 
             paraphrased_labels = []
 
-            # Generate multimodal instructions per chunk
             for i in range(len(motion_labels)):
+                motion_label = motion_labels[i]
+                motion_label = swap_directions(motion_label)
+
                 start_idx = i * CHUNK_SIZE
                 end_idx = min((i + 2) * CHUNK_SIZE - 1, len(steps) - 1)
-
                 start_img_array = steps[start_idx]["observation"]["image"]
                 end_img_array = steps[end_idx]["observation"]["image"]
                 start_img = Image.fromarray(start_img_array)
                 end_img = Image.fromarray(end_img_array)
-
                 paraphrased_label = generate_intermediate_instruction(
-                    start_img, end_img, task_instruction, motion_labels[i],
+                    start_img, end_img, task_instruction, motion_label
                 )
+                print(paraphrased_label)
                 paraphrased_labels.append(paraphrased_label)
-
-                # Save visualization
                 save_visualization(
                     start_img, end_img,
                     task_instruction, motion_labels[i],
                     paraphrased_label,
                     raw_dataset_name, ep_idx, i
                 )
-
-            # Save per-step JSON
             episode_dict = {}
             for step_idx, (orig, para) in enumerate(zip(motion_labels, paraphrased_labels)):
                 episode_dict[f"step_{step_idx}"] = {"original": orig, "paraphrased": para}
-
             augmented_data[raw_dataset_name][f"episode_{ep_idx}"] = episode_dict
-
-            # ----------------------------
-            # Print a few spaced-out examples
-            # ----------------------------
-            for j in range(0, len(motion_labels)):
+            for j in range(len(motion_labels)):
                 print(f"Original: {motion_labels[j]}, {task_instruction}\n-> Paraphrased: {paraphrased_labels[j]}")
                 print("-" * 50)
-
-        # Save dataset JSON
+            break
         output_json = f"paraphrased_instructions_{raw_dataset_name}.json"
         with open(output_json, "w") as f:
             json.dump(augmented_data, f, indent=2)
         print(f"Augmented dataset saved to {output_json}")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
-
