@@ -75,13 +75,17 @@ def array_to_jpeg_bytes(img_array) -> bytes:
     return buf.getvalue()
 
 def tile_frames(frames, thumbnail_size=(128,128), grid_cols=6):
-    font = ImageFont.load_default()
+    # Load a larger TrueType font
+    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)  # 16 pt font
+    #font = ImageFont.load_default()  # fallback if arial not found
+
     n_frames = len(frames)
     grid_rows = (n_frames + grid_cols - 1) // grid_cols
     tile_width, tile_height = thumbnail_size
     canvas_width = grid_cols * tile_width
     canvas_height = grid_rows * tile_height
     canvas = Image.new("RGB", (canvas_width, canvas_height), color=(255,255,255))
+
     for idx, frame in enumerate(frames):
         if idx >= grid_rows * grid_cols:
             break
@@ -90,8 +94,10 @@ def tile_frames(frames, thumbnail_size=(128,128), grid_cols=6):
         col = idx % grid_cols
         x, y = col * tile_width, row * tile_height
         canvas.paste(frame_thumb, (x, y))
+
         draw = ImageDraw.Draw(canvas)
-        draw.text((x+2, y+2), str(idx), fill="red", font=font)
+        draw.text((x+2, y+2), str(idx), fill="white", font=font)  # white text
+
     return canvas
 
 def visualize(steps, aug_labels, task_instruction=None, stride=1, filename=None):
@@ -157,35 +163,38 @@ async def generate_episode_instruction(rate_limiter, client, frames, task_instru
             ml_text += ', and keeping the gripper unchanged'
         ml_text += '.'
         motion_labels_text.append(f"step_{idx}: {ml_text}")
-    motion_labels_text_str = " ".join(motion_labels_text)
+    motion_labels_text_str = "\n".join(motion_labels_text)
     prompt = f"""
-    Overall Task: {task_instruction}.
-    Current motion of the robot (per frame): {motion_labels_text_str}
-    Note: left/right refers to left/right in the image, forward is into the screen, backward is toward the viewer.
+Overall Task: {task_instruction}.
+Current motion of the robot (per frame): 
+{motion_labels_text_str}
+Note: left/right refers to left/right in the image, forward is into the screen, backward is toward the viewer.
 
-    Inputs: A single tiled image of the robot performing the task, numbered by frame.
+Inputs: A single tiled image of the robot performing the task, numbered by frame.
 
-    Your task: Describe what subtask the robot is doing for each frame given its overall task and current motion.
-    Constraint: Only mention objects mentioned in the task, match the number of frames above.
+Your task: Describe what subtask the robot is doing for each frame given its overall task and current motion.
+Constraint: Only mention objects mentioned in the task, match the number of frames above.
 
-    Output format (JSON):
-    ```json
-    {{
-      "step_0": {{
-          "subtask": # briefly describe the robot’s current subtask,
-          "reasoning": # explain how you determined which stage the robot is in and what it is doing,
-          "command": # rephrase 'subtask' as a natural, user-style instruction to the robot,
-      }},
-      "step_1": {{
-          "subtask": "...",
-          "reasoning": "...",
-          "command": "..."
-      }},
-      ...
-    }}
-    ```
-    """
-    tiled_image = tile_frames(frames)
+Output format (JSON):
+```json
+{{
+  "step_0": {{
+      "subtask": # briefly describe the robot’s current subtask,
+      "reasoning": # explain how you determined which stage the robot is in and what it is doing,
+      "command": # rephrase 'subtask' as a natural, user-style instruction to the robot,
+  }},
+  "step_1": {{
+      "subtask": "...",
+      "reasoning": "...",
+      "command": "..."
+  }},
+  ...
+}}
+```
+"""
+    print(prompt)
+    tiled_image = tile_frames(frames[::CHUNK_SIZE])
+    tiled_image.save('test.jpg')
     tiled_bytes = array_to_jpeg_bytes(tiled_image)
     await rate_limiter.wait()
     response = await client.models.generate_content(
@@ -196,7 +205,6 @@ async def generate_episode_instruction(rate_limiter, client, frames, task_instru
         ]
     )
     text = response.text.strip()
-    print(text)
     if text.startswith("```json"): text=text[len("```json"):].strip()
     if text.endswith("```"): text=text[:-3].strip()
     try:
