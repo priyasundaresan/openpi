@@ -11,12 +11,16 @@ import numpy as np
 import tensorflow_datasets as tfds
 from google.genai import Client, types
 
+# Parameters
 DATA_DIR = "modified_libero_rlds"
-CHUNK_SIZE = 10
+RAW_DATASET_NAME = "libero_10_no_noops"
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
+
+CHUNK_SIZE = 10
+SEMAPHORE_LIMIT = 5  # max concurrent episodes
 RPM = 10000
-RAW_DATASET_NAME = "libero_10_no_noops"
+RPS = RPM / 60
 
 class RateLimiter:
     def __init__(self, rpm):
@@ -154,17 +158,22 @@ def visualize(steps, aug_labels, task_instruction=None, stride=1, filename=None)
     else:
         plt.show()
 
-async def generate_episode_instruction(rate_limiter, client, frames, task_instruction, motion_labels):
-    task_instruction = task_instruction[0].upper() + task_instruction[1:]
-    motion_labels_text = []
-    for idx, ml in enumerate(motion_labels):
-        ml_text = ml.replace('move','Moving').replace('open','and opening the').replace('close','and closing the')
-        if 'gripper' not in ml_text:
-            ml_text += ', and keeping the gripper unchanged'
-        ml_text += '.'
-        motion_labels_text.append(f"step_{idx}: {ml_text}")
-    motion_labels_text_str = "\n".join(motion_labels_text)
-    prompt = f"""
+async def generate_episode_instruction(semaphore, ep_idx, frames, task_instruction, motion_labels, client):
+    async with semaphore:
+        # tile frames
+        tiled_image = await asyncio.to_thread(lambda: tile_frames(frames[::CHUNK_SIZE]))
+        tiled_bytes = await asyncio.to_thread(lambda: array_to_jpeg_bytes(tiled_image))
+
+        task_instruction = task_instruction[0].upper() + task_instruction[1:]
+        motion_labels_text = []
+        for idx, ml in enumerate(motion_labels):
+            ml_text = ml.replace('move','Moving').replace('open','and opening the').replace('close','and closing the')
+            if 'gripper' not in ml_text:
+                ml_text += ', and keeping the gripper unchanged'
+            ml_text += '.'
+            motion_labels_text.append(f"step_{idx}: {ml_text}")
+        motion_labels_text_str = "\n".join(motion_labels_text)
+        prompt = f"""
 Overall Task: {task_instruction}.
 Current motion of the robot (per frame): 
 {motion_labels_text_str}
@@ -192,72 +201,54 @@ Output format (JSON):
 }}
 ```
 """
-    print(prompt)
-    tiled_image = tile_frames(frames[::CHUNK_SIZE])
-    tiled_image.save('test.jpg')
-    tiled_bytes = array_to_jpeg_bytes(tiled_image)
-    await rate_limiter.wait()
-    response = await client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[
-            types.Part.from_bytes(data=tiled_bytes, mime_type="image/jpeg"),
-            prompt
-        ]
-    )
-    text = response.text.strip()
-    if text.startswith("```json"): text=text[len("```json"):].strip()
-    if text.endswith("```"): text=text[:-3].strip()
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        data = {}
-        print("Failed to parse JSON. Returning empty dictionary.")
-    return data
+        response = await client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                types.Part.from_bytes(data=tiled_bytes, mime_type="image/jpeg"),
+                prompt
+            ]
+        )
+        text = response.text.strip()
+        if text.startswith("```json"): text=text[len("```json"):].strip()
+        if text.endswith("```"): text=text[:-3].strip()
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            data = {}
+            print("Failed to parse JSON. Returning empty dictionary.")
+        return f"episode_{ep_idx}", data
 
-async def process_episode(episode, ep_idx, rate_limiter, client):
-    steps = list(episode["steps"].as_numpy_iterator())
-    delta_actions = [step["action"][:3] for step in steps]
-    grippers = [step["action"][-1] for step in steps]
-    task_instruction = swap_directions(steps[0]["language_instruction"].decode())
-    motion_labels = chunk_motion_labels(delta_actions, grippers, chunk_size=CHUNK_SIZE)
-    frames = [Image.fromarray(step["observation"]["image"]) for step in steps]
-    episode_json = await generate_episode_instruction(rate_limiter, client, frames, task_instruction, motion_labels)
-    paraphrased_labels = []
-    for i in range(len(motion_labels)):
-        step_key = f"step_{i}"
-        if step_key in episode_json:
-            paraphrased_labels.append(episode_json[step_key].get("command", task_instruction))
-    for s in paraphrased_labels:
-        tqdm.write(f"[Episode {ep_idx}] Sample paraphrase: {s}")
-    augmented_instructions = []
-    for p in paraphrased_labels:
-        for _ in range(CHUNK_SIZE):
-            augmented_instructions.append(p)
-    visualize(steps, augmented_instructions, task_instruction=task_instruction, stride=1,
-              filename=OUTPUT_DIR/f"{ep_idx}.gif")
-    episode_dict = {}
-    for i in range(len(motion_labels)):
-        step_key = f"step_{i}"
-        if step_key in episode_json:
-            episode_dict[step_key] = {
-                "original": motion_labels[i],
-                "paraphrased": episode_json[step_key].get("command", task_instruction).strip().lower().replace(',', '').replace('.', '')
-            }
-    return f"episode_{ep_idx}", episode_dict
 
-async def process_dataset(api_key):
+# ---- Main dataset processing ----
+async def process_dataset(api_key, num_episodes=5):
     client = Client(api_key=api_key).aio
-    rate_limiter = RateLimiter(RPM)
+    semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
+
     dataset = tfds.load(RAW_DATASET_NAME, data_dir=DATA_DIR, split="train")
-    augmented_data = {}
+
     async with client as aclient:
-        first_episode = next(iter(dataset))  # take only the first episode
-        ep_key, ep_data = await process_episode(first_episode, 0, rate_limiter, aclient)
-        augmented_data[ep_key] = ep_data
-    out_file = OUTPUT_DIR/f"paraphrased_instructions_{RAW_DATASET_NAME}_test.json"
-    with open(out_file, "w") as f:
-        json.dump(augmented_data, f, indent=2)
-    print(f"Augmented dataset saved to {out_file}")
+        tasks = []
+        for ep_idx, episode in zip(range(num_episodes), dataset):
+            # preprocess frames
+            steps = list(episode["steps"].as_numpy_iterator())
+            frames = [Image.fromarray(s["observation"]["image"]) for s in steps]
+            delta_actions = [s["action"][:3] for s in steps]
+            grippers = [s["action"][-1] for s in steps]
+            motion_labels = chunk_motion_labels(delta_actions, grippers, chunk_size=CHUNK_SIZE)
+            task_instruction = steps[0]["language_instruction"].decode()  # swap_directions if needed
+
+            tasks.append(generate_episode_instruction(semaphore, ep_idx, frames, task_instruction, motion_labels, aclient))
+
+        # run all tasks concurrently
+        results = await asyncio.gather(*tasks)
+
+        # save results
+        augmented_data = {ep_key: ep_data for ep_key, ep_data in results}
+        out_file = OUTPUT_DIR / f"paraphrased_instructions_{RAW_DATASET_NAME}_tier3.json"
+        with open(out_file, "w") as f:
+            json.dump(augmented_data, f, indent=2)
+        print(f"Augmented dataset saved to {out_file}")
+
 
 if __name__=="__main__":
     import argparse
@@ -265,4 +256,3 @@ if __name__=="__main__":
     parser.add_argument("--api_key", type=str, required=True, help="Google API key for Gemini")
     args = parser.parse_args()
     asyncio.run(process_dataset(args.api_key))
-
