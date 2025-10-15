@@ -13,7 +13,12 @@ from google.genai import Client, types
 
 # Parameters
 DATA_DIR = "modified_libero_rlds"
-RAW_DATASET_NAME = "libero_10_no_noops"
+RAW_DATASET_NAMES = [
+    "libero_10_no_noops",
+    "libero_goal_no_noops",
+    "libero_object_no_noops",
+    "libero_spatial_no_noops",
+]
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -220,34 +225,37 @@ Output format (JSON):
 
 
 # ---- Main dataset processing ----
-async def process_dataset(api_key, num_episodes=5):
+async def process_dataset(api_key, num_episodes=None):
     client = Client(api_key=api_key).aio
     semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
 
-    dataset = tfds.load(RAW_DATASET_NAME, data_dir=DATA_DIR, split="train")
+    for RAW_DATASET_NAME in RAW_DATASET_NAMES:
+        dataset = tfds.load(RAW_DATASET_NAME, data_dir=DATA_DIR, split="train")
 
-    async with client as aclient:
-        tasks = []
-        for ep_idx, episode in zip(range(num_episodes), dataset):
-            # preprocess frames
-            steps = list(episode["steps"].as_numpy_iterator())
-            frames = [Image.fromarray(s["observation"]["image"]) for s in steps]
-            delta_actions = [s["action"][:3] for s in steps]
-            grippers = [s["action"][-1] for s in steps]
-            motion_labels = chunk_motion_labels(delta_actions, grippers, chunk_size=CHUNK_SIZE)
-            task_instruction = steps[0]["language_instruction"].decode()  # swap_directions if needed
+        async with client as aclient:
+            tasks = []
+            for ep_idx, episode in enumerate(dataset):
+                if num_episodes and ep_idx >= num_episodes:
+                    break
+                # preprocess frames
+                steps = list(episode["steps"].as_numpy_iterator())
+                frames = [Image.fromarray(s["observation"]["image"]) for s in steps]
+                delta_actions = [s["action"][:3] for s in steps]
+                grippers = [s["action"][-1] for s in steps]
+                motion_labels = chunk_motion_labels(delta_actions, grippers, chunk_size=CHUNK_SIZE)
+                task_instruction = steps[0]["language_instruction"].decode()  # swap_directions if needed
 
-            tasks.append(generate_episode_instruction(semaphore, ep_idx, frames, task_instruction, motion_labels, aclient))
+                tasks.append(generate_episode_instruction(semaphore, ep_idx, frames, task_instruction, motion_labels, aclient))
 
-        # run all tasks concurrently
-        results = await asyncio.gather(*tasks)
+            # run all tasks concurrently
+            results = await asyncio.gather(*tasks)
 
-        # save results
-        augmented_data = {ep_key: ep_data for ep_key, ep_data in results}
-        out_file = OUTPUT_DIR / f"paraphrased_instructions_{RAW_DATASET_NAME}_tier3.json"
-        with open(out_file, "w") as f:
-            json.dump(augmented_data, f, indent=2)
-        print(f"Augmented dataset saved to {out_file}")
+            # save results
+            augmented_data = {ep_key: ep_data for ep_key, ep_data in results}
+            out_file = OUTPUT_DIR / f"paraphrased_instructions_{RAW_DATASET_NAME}.json"
+            with open(out_file, "w") as f:
+                json.dump(augmented_data, f, indent=2)
+            print(f"Augmented dataset saved to {out_file}")
 
 
 if __name__=="__main__":
@@ -255,4 +263,4 @@ if __name__=="__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--api_key", type=str, required=True, help="Google API key for Gemini")
     args = parser.parse_args()
-    asyncio.run(process_dataset(args.api_key))
+    asyncio.run(process_dataset(args.api_key, num_episodes=3))
