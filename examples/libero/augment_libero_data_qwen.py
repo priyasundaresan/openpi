@@ -311,7 +311,7 @@ def main():
         task="text2text-generation",
         model=MODEL_ID,
         device=device,
-        torch_dtype=torch.bfloat16
+        dtype=torch.bfloat16
     )
 
     for ep_idx, episode in enumerate(tqdm(raw_dataset, desc=f"Dataset {dataset_name}")):
