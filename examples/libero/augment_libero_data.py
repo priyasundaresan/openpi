@@ -47,6 +47,11 @@ pipe = pipeline(
     dtype=torch.bfloat16
 )
 
+def swap_directions(instruction):
+    instruction = instruction.replace('left', '__TEMP_LEFT__').replace('right', 'left').replace('__TEMP_LEFT__', 'right')
+    instruction = instruction.replace('forward', '__TEMP_FORWARD__').replace('backward', 'forward').replace('__TEMP_FORWARD__', 'backward')
+    return instruction
+
 # ----------------------------
 # Motion chunking
 # ----------------------------
@@ -237,7 +242,9 @@ def main():
             # Half the time, use the original task
             num_to_replace = len(motion_labels) // 2
             replace_indices = set(random.sample(range(len(motion_labels)), num_to_replace))
+            task_instruction = swap_directions(task_instruction)
             for i in range(len(motion_labels)):
+                motion_labels[i] = swap_directions(motion_labels[i])
                 if i in replace_indices:
                     motion_labels[i] = task_instruction
 

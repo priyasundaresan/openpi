@@ -70,10 +70,14 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
         dir="gs://openpi-assets/checkpoints/pi05_droid",
     ),
     EnvMode.LIBERO: Checkpoint(
+        config="pi05_libero_aug_lora_low_mem_finetune",
+        dir="checkpoints_new/pi05_libero_aug_lora_low_mem_finetune/aug_libero_pi05_lora/25000",
+        #config="pi05_libero_rth_lora_low_mem_finetune",
+        #dir="checkpoints_new/pi05_libero_rth_lora_low_mem_finetune/rth_libero_pi05_lora/29999",
         #config="pi05_libero",
         #dir="checkpoints/pi05_libero",
-        config="pi0_libero_rth_low_mem_finetune",
-        dir="checkpoints_new/pi0_libero_rth_low_mem_finetune/rth_libero/27000",
+        #config="pi0_libero_rth_low_mem_finetune",
+        #dir="checkpoints_new/pi0_libero_rth_low_mem_finetune/rth_libero/27000",
     ),
 }
 
