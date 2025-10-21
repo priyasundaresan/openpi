@@ -1,6 +1,8 @@
 import argparse
 import json
 import random
+import signal
+import sys
 from pathlib import Path
 from collections import Counter
 from PIL import Image
@@ -16,9 +18,8 @@ import matplotlib.pyplot as plt
 # CONFIG
 # ----------------------------
 DATA_DIR = "modified_libero_rlds"
-OUTPUT_DIR = Path("output")
-QWEN_OUTPUT_DIR = Path("output_qwen")
-QWEN_OUTPUT_DIR.mkdir(exist_ok=True)
+DEFAULT_OUTPUT_DIR = Path("output_qwen_checkpoints")
+DEFAULT_OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
 CHUNK_SIZE = 10
 BATCH_SIZE = 64
@@ -30,6 +31,29 @@ PARAPHRASED_JSONS = {
     "libero_object_no_noops": "paraphrased_instructions_libero_object_no_noops.json",
     "libero_spatial_no_noops": "paraphrased_instructions_libero_spatial_no_noops.json",
 }
+
+# ----------------------------
+# Global state for signal handling
+# ----------------------------
+terminate_requested = False
+last_ckpt_path = None
+last_ckpt_data = None
+
+def handle_termination(signum, frame):
+    """Handle SIGTERM and SIGINT by saving current checkpoint."""
+    global terminate_requested, last_ckpt_data, last_ckpt_path
+    print(f"\nReceived signal {signum} — saving checkpoint before exit...")
+    terminate_requested = True
+    if last_ckpt_data is not None and last_ckpt_path is not None:
+        try:
+            save_checkpoint(last_ckpt_data, last_ckpt_path)
+            print(f"Checkpoint saved at {last_ckpt_path}")
+        except Exception as e:
+            print(f"Failed to save checkpoint on signal: {e}")
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, handle_termination)
+signal.signal(signal.SIGINT, handle_termination)
 
 # ----------------------------
 # Motion chunking
@@ -231,50 +255,83 @@ def swap_directions(instruction):
     return instruction
 
 # ----------------------------
-# MAIN PROCESS
+# Checkpoint helpers
+# ----------------------------
+def load_checkpoint(path: Path):
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        print(f"Warning: checkpoint at {path} is corrupt, restarting from scratch.")
+        return {}
+
+def save_checkpoint(data: dict, path: Path):
+    tmp_path = path.with_suffix(".tmp")
+    with open(tmp_path, "w") as f:
+        json.dump(data, f)
+    tmp_path.replace(path)
+
+# ----------------------------
+# MAIN
 # ----------------------------
 def main():
+    global last_ckpt_data, last_ckpt_path
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", required=True, help="Dataset name (e.g., libero_10_no_noops)")
-    parser.add_argument("--device", type=int, default=0, help="GPU device ID")
+    parser.add_argument("--dataset", required=True)
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--output_dir", default=str(DEFAULT_OUTPUT_DIR))
     args = parser.parse_args()
 
     dataset_name = args.dataset
     device = args.device
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     json_file = PARAPHRASED_JSONS.get(dataset_name)
     if json_file is None:
-        raise ValueError(f"Unknown dataset name: {dataset_name}")
+        raise ValueError(f"Unknown dataset: {dataset_name}")
 
-    in_path = OUTPUT_DIR / json_file
+    in_path = Path("output") / json_file
     print(f"Loading paraphrased JSON: {in_path}")
     data = json.load(open(in_path))
 
     print(f"Loading dataset: {dataset_name}")
     raw_dataset = tfds.load(dataset_name, data_dir=DATA_DIR, split="train")
 
+    ckpt_path = output_dir / f"paraphrased_instructions_{dataset_name}.json"
+    last_ckpt_path = ckpt_path
+    augmented_data = load_checkpoint(ckpt_path)
+    last_ckpt_data = augmented_data
+
     print(f"Initializing Qwen model on device {device} ...")
     pipe = pipeline(
         task="text2text-generation",
         model=MODEL_ID,
         device=device,
-        dtype=torch.bfloat16
+        torch_dtype=torch.bfloat16
     )
 
-    augmented_data = {}
-
     for ep_idx, episode in enumerate(tqdm(raw_dataset, desc=f"Dataset {dataset_name}")):
+        if terminate_requested:
+            print("Termination requested, stopping cleanly...")
+            break
+
+        ep_key = f"episode_{ep_idx}"
+        if ep_key in augmented_data:
+            continue  # already processed
+
         steps = list(episode["steps"].as_numpy_iterator())
         delta_actions = [s["action"][:3] for s in steps]
         grippers = [s["action"][-1] for s in steps]
-
         motion_labels = chunk_motion_labels(delta_actions, grippers)
         task_instruction = steps[0]["language_instruction"].decode()
 
         task_instruction = swap_directions(task_instruction)
         motion_labels = [swap_directions(l) for l in motion_labels]
 
-        # Weighted label selection
         step_labels = []
         sources = ["original", "motion", "gemini"]
         weights = [0.2, 0.4, 0.4]
@@ -288,31 +345,27 @@ def main():
                 label = data[f"episode_{ep_idx}"][f"step_{i}"]["paraphrased"]
             step_labels.append(label)
 
-        # Qwen paraphrasing
         paraphrased_labels = []
         for i in range(0, len(step_labels), BATCH_SIZE):
+            if terminate_requested:
+                break
             batch = step_labels[i:i+BATCH_SIZE]
             prompts = [make_prompt(lbl) for lbl in batch]
             results = pipe(prompts, max_new_tokens=64, temperature=1.2, top_p=0.9)
             paraphrased_labels.extend([parse_first_json(r["generated_text"]) for r in results])
 
-        episode_dict = {f"step_{i}": {"original": step_labels[i], "paraphrased": paraphrased_labels[i]}
-                        for i in range(len(step_labels))}
-        augmented_data[f"episode_{ep_idx}"] = episode_dict
+        augmented_data[ep_key] = {
+            f"step_{i}": {"original": step_labels[i], "paraphrased": paraphrased_labels[i]}
+            for i in range(len(step_labels))
+        }
 
-        ## Save GIF
-        #visualize_labels = []
-        #for l in paraphrased_labels:
-        #    for _ in range(CHUNK_SIZE):
-        #        visualize_labels.append(l)
+        last_ckpt_data = augmented_data
+        save_checkpoint(augmented_data, ckpt_path)
+        print(f"Saved checkpoint after episode {ep_idx}")
 
-        #visualize(steps, visualize_labels, task_instruction,
-        #          filename=QWEN_OUTPUT_DIR / f"{dataset_name}_episode_{ep_idx}.gif")
-
-    out_file = QWEN_OUTPUT_DIR / f"paraphrased_instructions_{dataset_name}.json"
-    with open(out_file, "w") as f:
-        json.dump(augmented_data, f, indent=2)
-    print(f"✅ Saved rephrased JSON: {out_file}")
+    print(f"Finished or stopped for {dataset_name}")
+    print(f"Final output: {ckpt_path}")
 
 if __name__ == "__main__":
     main()
+
