@@ -1,8 +1,9 @@
+import argparse
 import json
 import random
 from pathlib import Path
 from collections import Counter
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -15,31 +16,20 @@ import matplotlib.pyplot as plt
 # CONFIG
 # ----------------------------
 DATA_DIR = "modified_libero_rlds"
-OUTPUT_DIR = Path("output")          # original output
-QWEN_OUTPUT_DIR = Path("output_qwen")  # new Qwen outputs
+OUTPUT_DIR = Path("output")
+QWEN_OUTPUT_DIR = Path("output_qwen")
 QWEN_OUTPUT_DIR.mkdir(exist_ok=True)
-
-PARAPHRASED_JSONS = [
-    "paraphrased_instructions_libero_10_no_noops.json",
-    "paraphrased_instructions_libero_goal_no_noops.json",
-    "paraphrased_instructions_libero_object_no_noops.json",
-    "paraphrased_instructions_libero_spatial_no_noops.json",
-]
 
 CHUNK_SIZE = 10
 BATCH_SIZE = 64
-DEVICE = 0
 MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
 
-# ----------------------------
-# Load Qwen Pipeline
-# ----------------------------
-pipe = pipeline(
-    task="text2text-generation",
-    model=MODEL_ID,
-    device=DEVICE,
-    dtype=torch.bfloat16
-)
+PARAPHRASED_JSONS = {
+    "libero_10_no_noops": "paraphrased_instructions_libero_10_no_noops.json",
+    "libero_goal_no_noops": "paraphrased_instructions_libero_goal_no_noops.json",
+    "libero_object_no_noops": "paraphrased_instructions_libero_object_no_noops.json",
+    "libero_spatial_no_noops": "paraphrased_instructions_libero_spatial_no_noops.json",
+}
 
 # ----------------------------
 # Motion chunking
@@ -47,7 +37,6 @@ pipe = pipeline(
 def chunk_motion_labels(delta_actions, grippers, chunk_size=CHUNK_SIZE, move_thresh=1e-3, frac_thresh=0.25):
     n = len(delta_actions)
     chunk_labels = []
-
     for start in range(0, n, chunk_size):
         end = min(start + chunk_size, n)
         window_actions = delta_actions[start:end]
@@ -85,7 +74,6 @@ def chunk_motion_labels(delta_actions, grippers, chunk_size=CHUNK_SIZE, move_thr
         parts = [p for p in [x_label, y_label, z_label, g_label] if p not in ("stay", None)]
         label = "move " + " ".join(parts) if parts else "stay"
         chunk_labels.append(label)
-
     return chunk_labels
 
 def make_prompt(instruction: str) -> str:
@@ -246,72 +234,85 @@ def swap_directions(instruction):
 # MAIN PROCESS
 # ----------------------------
 def main():
-    for json_file in PARAPHRASED_JSONS:
-        in_path = OUTPUT_DIR / json_file
-        data = json.load(open(in_path))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", required=True, help="Dataset name (e.g., libero_10_no_noops)")
+    parser.add_argument("--device", type=int, default=0, help="GPU device ID")
+    args = parser.parse_args()
 
-        dataset_name = json_file.replace("paraphrased_instructions_", "").replace(".json", "")
-        raw_dataset = tfds.load(dataset_name, data_dir=DATA_DIR, split="train")
+    dataset_name = args.dataset
+    device = args.device
 
-        augmented_data = {}
+    json_file = PARAPHRASED_JSONS.get(dataset_name)
+    if json_file is None:
+        raise ValueError(f"Unknown dataset name: {dataset_name}")
 
-        for ep_idx, episode in enumerate(tqdm(raw_dataset, desc=f"Dataset {dataset_name}")):
-            steps = list(episode["steps"].as_numpy_iterator())
-            delta_actions = [s["action"][:3] for s in steps]
-            grippers = [s["action"][-1] for s in steps]
+    in_path = OUTPUT_DIR / json_file
+    print(f"Loading paraphrased JSON: {in_path}")
+    data = json.load(open(in_path))
 
-            motion_labels = chunk_motion_labels(delta_actions, grippers)
-            task_instruction = steps[0]["language_instruction"].decode()
+    print(f"Loading dataset: {dataset_name}")
+    raw_dataset = tfds.load(dataset_name, data_dir=DATA_DIR, split="train")
 
-            # Swap the directions to be aligned with the camera
-            task_instruction = swap_directions(task_instruction)
-            motion_labels = [swap_directions(l) for l in motion_labels]
+    print(f"Initializing Qwen model on device {device} ...")
+    pipe = pipeline(
+        task="text2text-generation",
+        model=MODEL_ID,
+        device=device,
+        dtype=torch.bfloat16
+    )
 
-            # randomly choose source per step: original / motion / gemini
-            step_labels = []
-            sources = ["original", "motion", "gemini"]
-            weights = [0.2, 0.4, 0.4]  # probabilities for each source
-            
-            for i in range(len(motion_labels)):
-                source = random.choices(sources, weights=weights, k=1)[0]
-                if source == "original":
-                    label = task_instruction
-                elif source == "motion":
-                    label = motion_labels[i]
-                else:  # "gemini"
-                    label = data[f"episode_{ep_idx}"][f"step_{i}"]["paraphrased"]
-                step_labels.append(label)
+    augmented_data = {}
 
-            # ----------------------------
-            # Batch Qwen rephrasing
-            # ----------------------------
-            paraphrased_labels = []
-            for i in range(0, len(step_labels), BATCH_SIZE):
-                batch = step_labels[i:i+BATCH_SIZE]
-                prompts = [make_prompt(lbl) for lbl in batch]
-                results = pipe(prompts, max_new_tokens=64, temperature=1.2, top_p=0.9)
-                paraphrased_labels.extend([parse_first_json(r["generated_text"]) for r in results])
+    for ep_idx, episode in enumerate(tqdm(raw_dataset, desc=f"Dataset {dataset_name}")):
+        steps = list(episode["steps"].as_numpy_iterator())
+        delta_actions = [s["action"][:3] for s in steps]
+        grippers = [s["action"][-1] for s in steps]
 
-            # Save per-step JSON
-            episode_dict = {f"step_{i}": {"original": step_labels[i], "paraphrased": paraphrased_labels[i]}
-                            for i in range(len(step_labels))}
-            augmented_data[f"episode_{ep_idx}"] = episode_dict
+        motion_labels = chunk_motion_labels(delta_actions, grippers)
+        task_instruction = steps[0]["language_instruction"].decode()
 
-            ## Save GIF
-            #visualize_labels = []
-            #for l in paraphrased_labels:
-            #    for _ in range(CHUNK_SIZE):
-            #        visualize_labels.append(l)
+        task_instruction = swap_directions(task_instruction)
+        motion_labels = [swap_directions(l) for l in motion_labels]
 
-            #visualize(steps, visualize_labels, task_instruction,
-            #          filename=QWEN_OUTPUT_DIR / f"{dataset_name}_episode_{ep_idx}.gif")
+        # Weighted label selection
+        step_labels = []
+        sources = ["original", "motion", "gemini"]
+        weights = [0.2, 0.4, 0.4]
+        for i in range(len(motion_labels)):
+            source = random.choices(sources, weights=weights, k=1)[0]
+            if source == "original":
+                label = task_instruction
+            elif source == "motion":
+                label = motion_labels[i]
+            else:
+                label = data[f"episode_{ep_idx}"][f"step_{i}"]["paraphrased"]
+            step_labels.append(label)
 
-        # Save final JSON
-        out_file = QWEN_OUTPUT_DIR / f"paraphrased_instructions_{dataset_name}.json"
-        with open(out_file, "w") as f:
-            json.dump(augmented_data, f, indent=2)
-        print(f"Saved rephrased JSON: {out_file}")
+        # Qwen paraphrasing
+        paraphrased_labels = []
+        for i in range(0, len(step_labels), BATCH_SIZE):
+            batch = step_labels[i:i+BATCH_SIZE]
+            prompts = [make_prompt(lbl) for lbl in batch]
+            results = pipe(prompts, max_new_tokens=64, temperature=1.2, top_p=0.9)
+            paraphrased_labels.extend([parse_first_json(r["generated_text"]) for r in results])
 
-if __name__=="__main__":
+        episode_dict = {f"step_{i}": {"original": step_labels[i], "paraphrased": paraphrased_labels[i]}
+                        for i in range(len(step_labels))}
+        augmented_data[f"episode_{ep_idx}"] = episode_dict
+
+        ## Save GIF
+        #visualize_labels = []
+        #for l in paraphrased_labels:
+        #    for _ in range(CHUNK_SIZE):
+        #        visualize_labels.append(l)
+
+        #visualize(steps, visualize_labels, task_instruction,
+        #          filename=QWEN_OUTPUT_DIR / f"{dataset_name}_episode_{ep_idx}.gif")
+
+    out_file = QWEN_OUTPUT_DIR / f"paraphrased_instructions_{dataset_name}.json"
+    with open(out_file, "w") as f:
+        json.dump(augmented_data, f, indent=2)
+    print(f"✅ Saved rephrased JSON: {out_file}")
+
+if __name__ == "__main__":
     main()
-
