@@ -24,7 +24,7 @@ OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 CHUNK_SIZE = 10
-SEMAPHORE_LIMIT = 5  # max concurrent episodes
+BATCH_SIZE = 100  # max concurrent episodes
 RPM = 10000
 RPS = RPM / 60
 
@@ -213,12 +213,13 @@ Output format (JSON):
                 prompt
             ]
         )
-        text = response.text.strip()
-        if text.startswith("```json"): text=text[len("```json"):].strip()
-        if text.endswith("```"): text=text[:-3].strip()
         try:
+            text = response.text.strip()
+            if text.startswith("```json"): text=text[len("```json"):].strip()
+            if text.endswith("```"): text=text[:-3].strip()
             data = json.loads(text)
-        except json.JSONDecodeError:
+        except:
+            print(response)
             data = {}
             print("Failed to parse JSON. Returning empty dictionary.")
 
@@ -232,77 +233,133 @@ Output format (JSON):
         return f"episode_{ep_idx}", episode_dict
 
 
-# ---- Main dataset processing ----
 async def process_dataset(api_key, num_episodes=None):
     client = Client(api_key=api_key).aio
-    semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
     all_augmented_data = {}
 
     for RAW_DATASET_NAME in RAW_DATASET_NAMES:
         dataset = tfds.load(RAW_DATASET_NAME, data_dir=DATA_DIR, split="train")
-        print(f"Processing dataset {RAW_DATASET_NAME} with {len(dataset)} episodes")
+        dataset = list(dataset)  # materialize so we can slice into batches
+        total_episodes = len(dataset)
+        print(f"Processing dataset {RAW_DATASET_NAME} with {total_episodes} episodes")
+
+        if num_episodes:
+            dataset = dataset[:num_episodes]
+            total_episodes = len(dataset)
 
         all_augmented_data[RAW_DATASET_NAME] = {}
 
         async with client as aclient:
-            tasks = []
-            for ep_idx, episode in enumerate(dataset):
-                if num_episodes and ep_idx >= num_episodes:
-                    break
+            # process in batches of BATCH_SIZE
+            for start in range(0, total_episodes, BATCH_SIZE):
+                end = min(start + BATCH_SIZE, total_episodes)
+                batch = dataset[start:end]
+                print(f"  → Processing episodes {start}–{end-1}")
 
-                steps = list(episode["steps"].as_numpy_iterator())
-                frames = [Image.fromarray(s["observation"]["image"]) for s in steps]
-                delta_actions = [s["action"][:3] for s in steps]
-                grippers = [s["action"][-1] for s in steps]
-                motion_labels = chunk_motion_labels(delta_actions, grippers, chunk_size=CHUNK_SIZE)
-                task_instruction = steps[0]["language_instruction"].decode()
+                semaphore = asyncio.Semaphore(BATCH_SIZE)
+                tasks = []
 
-                tasks.append(
-                    generate_episode_instruction(semaphore, ep_idx, frames, task_instruction, motion_labels, aclient)
-                )
+                for ep_idx, episode in enumerate(batch, start=start):
+                    steps = list(episode["steps"].as_numpy_iterator())
+                    frames = [Image.fromarray(s["observation"]["image"]) for s in steps]
+                    delta_actions = [s["action"][:3] for s in steps]
+                    grippers = [s["action"][-1] for s in steps]
+                    motion_labels = chunk_motion_labels(delta_actions, grippers, chunk_size=CHUNK_SIZE)
+                    task_instruction = steps[0]["language_instruction"].decode()
 
-            # Run all episodes concurrently
-            results = await asyncio.gather(*tasks)
+                    tasks.append(
+                        generate_episode_instruction(semaphore, ep_idx, frames, task_instruction, motion_labels, aclient)
+                    )
 
-            # Save per-dataset JSON
-            for ep_key, ep_data in results:
-                all_augmented_data[RAW_DATASET_NAME][ep_key] = ep_data
+                # Run this batch concurrently
+                results = await asyncio.gather(*tasks)
 
-        # Save JSON file
-        out_file = OUTPUT_DIR / f"paraphrased_instructions_{RAW_DATASET_NAME}.json"
-        with open(out_file, "w") as f:
-            json.dump(all_augmented_data[RAW_DATASET_NAME], f, indent=2)
-        print(f"Augmented dataset saved to {out_file}")
+                # Store results
+                for ep_key, ep_data in results:
+                    all_augmented_data[RAW_DATASET_NAME][ep_key] = ep_data
 
-        ## --- Generate some GIFs using paraphrased labels ---
-        #MAX_GIFS = 3
-        #dataset_iter = tfds.load(RAW_DATASET_NAME, data_dir=DATA_DIR, split="train")
-        #
-        #for ep_idx, episode in enumerate(dataset_iter):
-        #    if ep_idx >= MAX_GIFS:
-        #        break
-        #
-        #    ep_key = f"episode_{ep_idx}"
-        #    if ep_key not in all_augmented_data[RAW_DATASET_NAME]:
-        #        continue
-        #
-        #    ep_data = all_augmented_data[RAW_DATASET_NAME][ep_key]
-        #    paraphrased_labels = []
-        #    for i in range(len(ep_data)):
-        #        for _ in range(CHUNK_SIZE):
-        #            paraphrased_labels.append(ep_data[f"step_{i}"]["paraphrased"])
-        #
-        #    steps = list(episode["steps"].as_numpy_iterator())
-        #    task_instruction = steps[0]["language_instruction"].decode()
-        #
-        #    visualize(
-        #        steps=steps,
-        #        aug_labels=paraphrased_labels,
-        #        task_instruction=task_instruction,
-        #        stride=1,
-        #        filename=str(OUTPUT_DIR / f"{RAW_DATASET_NAME}_{ep_key}.gif")
-        #    )
-        #    print(f"Saved GIF for {RAW_DATASET_NAME} {ep_key}")
+                # optional: save intermediate JSON after each batch
+                out_file = OUTPUT_DIR / f"paraphrased_instructions_{RAW_DATASET_NAME}.json"
+                with open(out_file, "w") as f:
+                    json.dump(all_augmented_data[RAW_DATASET_NAME], f, indent=2)
+                print(f"  ✓ Saved progress through episode {end-1}")
+
+        print(f"Finished {RAW_DATASET_NAME}")
+
+## ---- Main dataset processing ----
+#async def process_dataset(api_key, num_episodes=None):
+#    client = Client(api_key=api_key).aio
+#    semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
+#    all_augmented_data = {}
+#
+#    for RAW_DATASET_NAME in tqdm(RAW_DATASET_NAMES, desc="Datasets"):
+#        dataset = tfds.load(RAW_DATASET_NAME, data_dir=DATA_DIR, split="train")
+#        print(f"Processing dataset {RAW_DATASET_NAME} with {len(dataset)} episodes")
+#
+#        all_augmented_data[RAW_DATASET_NAME] = {}
+#
+#        async with client as aclient:
+#            tasks = []
+#            for ep_idx, episode in tqdm(enumerate(dataset), desc=f"Loading {RAW_DATASET_NAME} episodes"):
+#                if num_episodes and ep_idx >= num_episodes:
+#                    break
+#        
+#                steps = list(episode["steps"].as_numpy_iterator())
+#                frames = [Image.fromarray(s["observation"]["image"]) for s in steps]
+#                delta_actions = [s["action"][:3] for s in steps]
+#                grippers = [s["action"][-1] for s in steps]
+#                motion_labels = chunk_motion_labels(delta_actions, grippers, chunk_size=CHUNK_SIZE)
+#                task_instruction = steps[0]["language_instruction"].decode()
+#        
+#                tasks.append(
+#                    generate_episode_instruction(semaphore, ep_idx, frames, task_instruction, motion_labels, aclient)
+#                )
+#        
+#            # Wrap asyncio.gather with tqdm for progress
+#            results = []
+#            for f in async_tqdm(asyncio.as_completed(tasks), total=len(tasks), desc=f"Processing {RAW_DATASET_NAME}"):
+#                res = await f
+#                results.append(res)
+#
+#            # Save per-dataset JSON
+#            for ep_key, ep_data in results:
+#                all_augmented_data[RAW_DATASET_NAME][ep_key] = ep_data
+#
+#        # Save JSON file
+#        out_file = OUTPUT_DIR / f"paraphrased_instructions_{RAW_DATASET_NAME}.json"
+#        with open(out_file, "w") as f:
+#            json.dump(all_augmented_data[RAW_DATASET_NAME], f, indent=2)
+#        print(f"Augmented dataset saved to {out_file}")
+#
+#        ## --- Generate some GIFs using paraphrased labels ---
+#        #MAX_GIFS = 3
+#        #dataset_iter = tfds.load(RAW_DATASET_NAME, data_dir=DATA_DIR, split="train")
+#        #
+#        #for ep_idx, episode in enumerate(dataset_iter):
+#        #    if ep_idx >= MAX_GIFS:
+#        #        break
+#        #
+#        #    ep_key = f"episode_{ep_idx}"
+#        #    if ep_key not in all_augmented_data[RAW_DATASET_NAME]:
+#        #        continue
+#        #
+#        #    ep_data = all_augmented_data[RAW_DATASET_NAME][ep_key]
+#        #    paraphrased_labels = []
+#        #    for i in range(len(ep_data)):
+#        #        for _ in range(CHUNK_SIZE):
+#        #            paraphrased_labels.append(ep_data[f"step_{i}"]["paraphrased"])
+#        #
+#        #    steps = list(episode["steps"].as_numpy_iterator())
+#        #    task_instruction = steps[0]["language_instruction"].decode()
+#        #
+#        #    visualize(
+#        #        steps=steps,
+#        #        aug_labels=paraphrased_labels,
+#        #        task_instruction=task_instruction,
+#        #        stride=1,
+#        #        filename=str(OUTPUT_DIR / f"{RAW_DATASET_NAME}_{ep_key}.gif")
+#        #    )
+#        #    print(f"Saved GIF for {RAW_DATASET_NAME} {ep_key}")
 
 
 if __name__=="__main__":
@@ -311,4 +368,5 @@ if __name__=="__main__":
     parser.add_argument("--api_key", type=str, required=True, help="Google API key for Gemini")
     args = parser.parse_args()
     #asyncio.run(process_dataset(args.api_key, num_episodes=3))
+    #asyncio.run(process_dataset(args.api_key, num_episodes=100))
     asyncio.run(process_dataset(args.api_key))
